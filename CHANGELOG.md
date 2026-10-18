@@ -12,44 +12,27 @@ the notes of the version's GitHub Release.
 
 ### Added
 
-- A working example of scene triggers, scene actions and dashboard widgets
-  (Gladys 5.1.0 or later).
-- `CHANGELOG.md`, rolled by the Release workflow.
-- A GitHub Release for every version, with its changelog section as notes: the
-  Gladys Supervision page links each version to the repository's releases.
-- CI runs the tests on Node 22 and 24, and builds the Docker image.
-- Dependabot keeps the npm dependencies and the GitHub Actions up to date.
-- `SECURITY.md` (how to report a vulnerability) and `CLAUDE.md` (project rules
-  for contributors and coding assistants).
-- Manifest tests: `version` matches `package.json`, `docker_image` is tagged
-  with it, descriptions hold 10 to 100 characters, placeholders are
-  multi-language objects.
-- The latitude and longitude fields show an example value as placeholder.
+- First version, never tested with a real Smile: Plugwise Smile P1, Anna and
+  Adam through the local XML API (`/core/domain_objects`, plain HTTP, user
+  name `smile` and the Smile ID), ported from python-plugwise. Current
+  firmwares only; older ones, the Stretch and an Anna connected to an Adam
+  are said in the status.
+- Smile P1 (and Anna P1): power taken and injected, the consumption index
+  (peak + off-peak) for the energy monitoring through the index guard of
+  gladys-p1-monitor (never 0, tariffs checked, a jump or a drop held until
+  the "Accept the held index" button), indexes per tariff and injection as
+  plain sensors, gas as a volume sensor, phases.
+- Anna and Adam: per zone temperature, setpoint, heating state, mode, preset
+  and active schedule; boiler flame, heating, hot water, temperatures,
+  pressure, modulation; outdoor temperature; Adam gateway and regulation
+  modes; Plugwise plugs (power, relay).
+- Commands, off by default: setpoint, preset, Adam gateway mode and
+  regulation mode (heating / cooling only) behind `allow_climate`; relay of
+  the unlocked lighting and entertainment plugs behind `allow_plugs` (a plug
+  feeding a boiler, a pump, a fridge... is read only). Fresh read before
+  acting, 3.5 s budget, answer at 4.3 s at most.
+- A minimal XML reader without DTD (no XXE, no entity expansion), bounded
+  and linear.
+- Buttons "Test the connection" and "Accept the held index".
 
-### Changed
-
-- Node.js 22 or later is required (Node 20 is end-of-life).
-- Integration SDK 0.15.0. The tests now run against the fake Gladys of the
-  SDK, which refuses the payloads Gladys refuses.
-- The refresh interval is one minute minimum, the fastest Gladys polls a
-  device. The plug's power is only sent when it changes, and every 30
-  minutes otherwise.
-
-### Fixed
-
-- Gladys refused the devices of the Discovery tab: the weather station and
-  the plug declared their poll frequency in seconds instead of one of the
-  values Gladys accepts, and were never polled. They now poll every minute,
-  and the readings follow the refresh interval of the configuration.
-
-- The release commit no longer fails `npm run format:check`: the Release
-  workflow updates the manifest `version` and `docker_image` in place instead
-  of re-printing the whole file with `jq`.
-- The integration can write to `/data`: the image creates the directory owned
-  by the `node` user, a new Docker volume was owned by root.
-- A sub-container running the integration's own image follows it to the new
-  tag at each release, as well as in the manifest of the build summary: it kept
-  the previous tag, which may not exist on the registry. Sub-containers on a
-  third-party image (a broker, a database...) keep theirs.
-
-[Unreleased]: https://github.com/GladysAssistant/integration-template-js/commits/main
+[Unreleased]: https://github.com/LM1LC3N7/gladys-plugwise/commits/main

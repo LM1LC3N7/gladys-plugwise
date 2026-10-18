@@ -1,61 +1,154 @@
-# Demo Devices Template
+# Plugwise (Smile P1, Anna, Adam)
 
-This is the user documentation of the integration. Gladys re-hosts this file
-and shows a permanent **Documentation** link to it in the Configuration screen
-(in the user's language, with English as the fallback) — it is when
-configuring that the user needs it most. Keep the short onboarding hints in
-the `section` blocks of the manifest `config_schema`; put the long
-step-by-step (screenshots, troubleshooting…) here.
+Your Plugwise gateway in Gladys, through the local XML API of the **Smile**
+on your network, without any cloud:
 
-## What you get
+- **Smile P1** (smart meter): **power taken** and **injected** every 10
+  seconds, the **consumption index** (peak + off-peak tariff) every minute for
+  the Gladys energy monitoring, the **indexes per tariff** and the
+  **injection** as plain sensors, **gas** in m³, power and voltage of each
+  phase;
+- **Anna** and **Adam** (every 30 seconds): for each zone (Adam) or the room
+  of the Anna, **temperature**, **setpoint**, **heating state**, **mode**
+  (schedule, heating, off), **preset** and **active schedule**; for the boiler
+  or heat pump, **flame**, **heating**, **hot water running**, water
+  temperatures, **pressure**, modulation; the **outdoor temperature**; on an
+  Adam, the **gateway** and **regulation modes**, and the **power** and state
+  of the **Plugwise plugs**.
 
-Six demo devices show up after installation: a weather station (real data
-from Open-Meteo), a switch, a dimmable light, a smart plug with power
-metering, a motion sensor and a camera.
+> **This integration has never been tested with a real Smile.** This first
+> version was written from the python-plugwise library (the one of Home
+> Assistant) and tested only against its test data and a fake Smile. Tell on
+> the Gladys forum what works and what does not.
+
+Unofficial integration, not affiliated with Plugwise.
+
+## Supported Smiles
+
+- **Smile P1** firmware v4 (and a recent Smile P1 answering with a
+  `<gateway>` element), **Anna** firmware v4 (the Anna P1 included), **Adam**
+  firmware v3.
+- Not supported: the older firmwares (Smile P1 v2/v3 without `<gateway>`,
+  Anna v1/v3, Adam v2: update them from the Plugwise app), the **Stretch**, an
+  **Anna connected to an Adam** (add the Adam instead). The status of the
+  integration says so clearly.
 
 ## Configuration
 
-1. Open the **Configuration** tab of the integration.
-2. Set the **latitude** and **longitude** the demo weather station should
-   observe (they default to Paris), and pick your temperature unit.
-   The **refresh interval** sets how often the weather station and the
-   plug's power are read: every 5 minutes by default, every minute at most.
-3. Save: the devices appear in the **Discovery** tab, ready to be added.
+- **Smile address**: its IP address on your network (`192.168.1.30`), shown
+  by your router or the Plugwise app; a port may follow. Prefer the IP
+  address: a `.local` name (mDNS) does not resolve in the integration's
+  container. Give the Smile a fixed address in your router; if it changes,
+  type the new one: the devices and their history are kept. The local API
+  only speaks plain http: an `https://` address is refused with a clear
+  message.
+- **Smile ID**: the 8 characters printed on the back of the Smile (also in
+  the Plugwise app). Gladys signs in with the user name `smile` and this ID.
+  The ID is kept by Gladys in its database, never shown again, sent only to
+  the Smile, in the HTTP authentication header (never in an address, never
+  in a log). Beware: the Smile has no https, so the ID crosses your local
+  network in clear, at every read.
+- **Allow the thermostat commands** and **Allow switching the plugs**: off
+  by default (see Commands).
+- **Language of the devices**: French (default) or English.
 
-The **Prefer the local connection** toggle drives the demo plug: it reports
-the channel it actually uses as a badge (local or cloud), with an orange dot
-when it runs degraded (local refused, cloud fallback).
+Then open the **Discover** tab and create the devices to follow. The **Test
+the connection** button reads the Smile at once and lists what it shows.
 
-## Actions
+## Energy (Smile P1)
 
-- **Test the weather provider** — performs a live request to Open-Meteo and
-  shows the current temperature and humidity under the button.
-- **Identify a device** — pick one of your devices in the list and it will
-  signal itself (the demo light "blinks" in the logs).
+- The **consumption index** (peak + off-peak tariff, in kWh) is the only
+  value the Gladys energy monitoring counts and bills. It exists only when
+  the meter gives **both tariffs** at discovery; otherwise the device has
+  plain sensors only, out of the energy monitoring.
+- The indexes per tariff, the injection and gas are **plain sensors**: never
+  counted in the energy monitoring (gas would be billed at the electricity
+  price). The injection is never in the consumption index.
+- An index is **never published at 0**. Each tariff is checked: a tariff
+  falling to 0 or dropping alone is a reading glitch, not a drop of the
+  index.
+- A **jump** of the index (more than a home can use since the last value) or
+  a **drop** is **held back**: the last accepted value is sent again, the
+  status of the integration shows the jump and its kWh, and nothing is
+  billed. If it is right (meter replaced, real index), click **Accept the
+  held index** in the configuration: only the value shown (plus what the home
+  uses until the next read) is taken. Neither time, nor repetition, nor
+  saving the configuration accepts it. The held value is kept in `/data`
+  across a restart.
+- When the Smile says the meter is not connected (P1 cable), or when the
+  power has not been logged for 5 minutes, those values are no longer sent
+  and the status says so.
 
-## Scenes
+## Commands
 
-The integration adds its own cards to the scene editor (Gladys 5.1 or
-later), under the **Integrations** category:
+By default, Gladys only **reads**. Once an option is ticked, the dashboard,
+the scenes, the voice assistants (Siri / HomeKit, Alexa, Google Home) and the
+Thermostat service of Gladys can act.
 
-- **Motion detected** (trigger) — starts the scene when a demo motion sensor
-  sees something move. Optionally pick the sensor and what moved (person,
-  animal); left empty, any detection matches. The following actions can
-  read what moved with `{{triggerEvent.data.target}}`.
-- **Identify a device** (action) — makes the chosen device signal itself.
-  It returns whether the device could signal itself, so the following
-  actions can depend on it.
+- **Allow the thermostat commands**:
+  - the **setpoint** of a zone, **4 to 30 °C** and within the bounds the
+    Smile gives for the zone, to a tenth of a degree; a value outside is
+    refused, never clamped;
+  - the **preset** of a zone, among the Smile's (home, night, away,
+    vacation, frost protection...);
+  - on an Adam, the **gateway mode** (home, away, vacation) and the
+    **regulation mode**, **heating** or **cooling** (when present) only:
+    turning the regulation off and the bleeding cycles stay in the Plugwise
+    app.
+- **Allow switching the plugs**: only the plugs set in the Plugwise app as
+  **lamp, lighting, TV, home cinema, set-top box, recorder, game console or
+  charger**, and **not locked** in Plugwise. A plug feeding a boiler, a
+  heating pump, a valve, a water heater, a fridge, a freezer, an Internet
+  router, an appliance in the middle of a cycle, a kettle, or set as
+  "other", is **never** switched: its state is read only in Gladys (not a
+  switch), so "turn everything off" never reaches it. To command a plug, set
+  its type in the Plugwise app and unlock it, then delete and create its
+  device again in Gladys.
+- The **mode** (schedule / heating / off) and the **active schedule** are
+  read only in this version; hot water is never commanded.
+- Just before acting, Gladys **reads the Smile again** and decides on that
+  read only: the read fails, the device is gone, a value is missing, the
+  plug is locked or of a forbidden type, and nothing is sent; the value is
+  already the one asked, and nothing is sent either. The option is checked
+  when the command arrives and again just before sending.
+- When the command cannot be checked within 3.5 s, nothing is sent and Gladys
+  shows a failure (never an action after a failure shown). Once sent, Gladys
+  answers at most 4.3 s after your command: "sent, without confirmation"
+  when the Smile has not answered yet (the command may have been applied),
+  "refused" when the Smile refused it. The Smile is read again 5 s after
+  every command sent; the value shown is always the Smile's, never the one
+  asked.
+- Commands run one after the other (one Smile).
 
-## Dashboard
+## Refresh and limits
 
-Add the **Demo status** widget to a dashboard: it shows the live
-temperature of the weather station and the power of the office plug, the
-connection the plug currently uses (orange when degraded) and the observed
-location. Its **Identify the light** button makes the demo light signal
-itself.
+- A Smile P1 is read every **10 seconds** (the index every minute), an Anna
+  or an Adam every **30 seconds**. Only the values that change are sent to
+  Gladys (and each at least every 10 minutes).
+- The devices are known by their Plugwise ids (32 characters), not by their
+  name nor the address of the Smile.
+- The water temperatures of the boiler are probes: Gladys does not count them
+  in the temperature of the room.
 
-## Troubleshooting
+## Connection problems
 
-The integration logs everything it does: check the integration logs from the
-Gladys UI (or `docker logs` on the host) with `LOG_LEVEL=debug` for the full
-detail.
+- **Smile unreachable**: every device shows unreachable; new try after 30 s,
+  then less and less often up to every 10 min (never faster than the normal
+  reading).
+- **ID refused** (HTTP 401): Gladys does not try again by itself, neither
+  after a reconnection to Gladys nor after a restart (the refusal is kept in
+  `/data` as a hash, never the ID itself). Fix the ID and save, or press
+  **Test the connection**.
+- **Smile overloaded** (HTTP 429): every request stops for 1 minute to 6
+  hours, even across a restart; saving the configuration or pressing **Test
+  the connection** lifts the pause.
+- The logs never hold the Smile ID nor the text of the Smile's answers, only
+  codes (HTTP 500, no connection...).
+
+## Limits
+
+- One Smile per integration.
+- No command of hot water, of the schedules (turning a schedule on or off),
+  of the temperature offset, nor of plug groups.
+- No Stretch, no Plugwise USB stick.
+- Never tested with a real Smile.

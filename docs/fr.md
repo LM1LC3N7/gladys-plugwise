@@ -1,67 +1,160 @@
-# Template de démonstration
+# Plugwise (Smile P1, Anna, Adam)
 
-Ceci est la documentation utilisateur de l'intégration. Gladys ré-héberge ce
-fichier et affiche un lien **Documentation** permanent vers lui dans l'écran
-de configuration (dans la langue de l'utilisateur, avec l'anglais en repli) —
-c'est au moment de configurer que l'utilisateur en a le plus besoin. Gardez
-les courtes indications d'accueil dans les blocs `section` du `config_schema`
-du manifest ; mettez ici le pas-à-pas détaillé (captures d'écran, dépannage…).
+Votre passerelle Plugwise dans Gladys, par l'API XML locale du **Smile** sur
+votre réseau, sans cloud :
 
-## Ce que vous obtenez
+- **Smile P1** (compteur intelligent) : **puissance prélevée** et **injectée**
+  toutes les 10 secondes, **index de consommation** (tarif plein + tarif
+  creux) chaque minute pour le suivi énergétique de Gladys, **index par
+  tarif** et **injection** en simples capteurs, **gaz** en m³, puissance et
+  tension de chaque phase ;
+- **Anna** et **Adam** (toutes les 30 secondes) : pour chaque zone (Adam) ou
+  la pièce de l'Anna, **température**, **consigne**, **état du chauffage**,
+  **mode** (programme, chauffage, arrêt), **préréglage** et **programme
+  actif** ; pour la chaudière ou la pompe à chaleur, **flamme**, **chauffage**,
+  **eau chaude en cours**, températures de l'eau, **pression**, modulation ;
+  la **température extérieure** ; sur un Adam, les **modes de la
+  passerelle** et **de régulation**, et la **puissance** et l'état des
+  **prises Plugwise**.
 
-Six appareils de démonstration apparaissent après l'installation : une
-station météo (vraies données Open-Meteo), un interrupteur, une lampe
-variable, une prise connectée avec mesure de puissance, un détecteur de
-mouvement et une caméra.
+> **Cette intégration n'a jamais été testée avec un vrai Smile.** Cette
+> première version a été écrite à partir de la bibliothèque python-plugwise
+> (celle de Home Assistant) et testée seulement contre ses données de test et
+> un faux Smile. Dites sur le forum de Gladys ce qui marche et ce qui ne
+> marche pas.
+
+Intégration non officielle, sans lien avec Plugwise.
+
+## Smile pris en charge
+
+- **Smile P1** firmware v4 (et un Smile P1 récent qui répond avec un élément
+  `<gateway>`), **Anna** firmware v4 (y compris l'Anna P1), **Adam** firmware
+  v3.
+- Pas pris en charge : les anciens firmwares (Smile P1 v2/v3 sans
+  `<gateway>`, Anna v1/v3, Adam v2 : mettez-les à jour depuis l'app Plugwise),
+  le **Stretch**, un **Anna relié à un Adam** (ajoutez l'Adam à la place). Le
+  statut de l'intégration le dit clairement.
 
 ## Configuration
 
-1. Ouvrez l'onglet **Configuration** de l'intégration.
-2. Renseignez la **latitude** et la **longitude** que la station météo de
-   démonstration doit observer (Paris par défaut), et choisissez votre unité
-   de température. L'**intervalle de rafraîchissement** règle la fréquence
-   de lecture de la station météo et de la puissance de la prise : toutes
-   les 5 minutes par défaut, toutes les minutes au plus.
-3. Enregistrez : les appareils apparaissent dans l'onglet **Découverte**,
-   prêts à être ajoutés.
+- **Adresse du Smile** : son adresse IP sur votre réseau (`192.168.1.30`),
+  visible dans votre box ou dans l'app Plugwise ; un port peut suivre.
+  Préférez l'adresse IP : un nom en `.local` (mDNS) ne se résout pas dans le
+  conteneur de l'intégration. Donnez au Smile une adresse fixe dans votre
+  box ; si elle change, saisissez la nouvelle : les appareils et leur
+  historique sont gardés. L'API locale ne parle qu'en http simple : une
+  adresse `https://` est refusée avec un message clair.
+- **ID du Smile** : les 8 caractères imprimés au dos du Smile (aussi dans
+  l'app Plugwise). Gladys s'identifie avec l'identifiant `smile` et cet ID.
+  L'ID est gardé par Gladys dans sa base, jamais réaffiché, envoyé seulement
+  au Smile, dans l'en-tête HTTP d'authentification (jamais dans une adresse,
+  jamais dans un journal). Attention : le Smile n'a pas de https, l'ID
+  traverse donc votre réseau local en clair, à chaque lecture.
+- **Autoriser les commandes des thermostats** et **Autoriser la commande des
+  prises** : désactivées par défaut (voir Commandes).
+- **Langue des appareils** : français (par défaut) ou anglais.
 
-Le réglage **Préférer la connexion locale** pilote la prise de
-démonstration : elle affiche en badge le canal réellement utilisé (local ou
-cloud), avec un point orange quand elle fonctionne en mode dégradé (local
-refusé, bascule cloud).
+Ouvrez ensuite l'onglet **Découverte** et créez les appareils à suivre. Le
+bouton **Tester la connexion** lit le Smile tout de suite et liste ce qu'il
+montre.
 
-## Actions
+## Énergie (Smile P1)
 
-- **Tester le fournisseur météo** — effectue une requête en direct vers
-  Open-Meteo et affiche la température et l'humidité actuelles sous le
-  bouton.
-- **Identifier un appareil** — choisissez un de vos appareils dans la liste
-  et il se signale (la lampe de démonstration « clignote » dans les logs).
+- L'**index de consommation** (tarif plein + tarif creux, en kWh) est la seule
+  valeur que le suivi énergétique de Gladys compte et facture. Il n'existe que
+  si le compteur donne **les deux tarifs** au moment de la découverte ; sinon
+  l'appareil n'a que de simples capteurs, sans suivi énergétique.
+- Les index par tarif, l'injection et le gaz sont de **simples capteurs** :
+  jamais comptés dans le suivi énergétique (le gaz serait facturé au prix de
+  l'électricité). L'injection n'est jamais dans l'index de consommation.
+- Un index n'est **jamais publié à 0**. Chaque tarif est vérifié : un tarif
+  qui retombe à 0 ou qui baisse seul est un défaut de lecture, pas une
+  baisse de l'index.
+- Un **saut** de l'index (plus que ce qu'un foyer peut consommer depuis la
+  dernière valeur) ou une **baisse** est **retenu** : la dernière valeur
+  acceptée est renvoyée, l'état de l'intégration affiche le saut et son
+  nombre de kWh, et rien n'est facturé. S'il est juste (compteur remplacé,
+  index réel), cliquez sur **Accepter l'index retenu** dans la configuration :
+  seule la valeur affichée (plus ce que le foyer consomme d'ici la lecture
+  suivante) est prise. Ni le temps, ni la répétition, ni l'enregistrement de
+  la configuration ne l'acceptent. La valeur retenue est gardée dans `/data`
+  après un redémarrage.
+- Si le Smile indique que le compteur n'est pas connecté (câble P1), ou si la
+  puissance n'est plus relevée depuis 5 minutes, ces valeurs ne sont plus
+  envoyées et l'état le dit.
 
-## Scènes
+## Commandes
 
-L'intégration ajoute ses propres cartes à l'éditeur de scènes (Gladys 5.1
-ou plus récent), dans la catégorie **Intégrations** :
+Par défaut, Gladys ne fait que **lire**. Une fois une option cochée, le
+tableau de bord, les scènes, les assistants vocaux (Siri / HomeKit, Alexa,
+Google Home) et le service Thermostat de Gladys peuvent agir.
 
-- **Mouvement détecté** (déclencheur) — lance la scène quand un détecteur
-  de démonstration voit bouger quelque chose. Choisissez éventuellement le
-  détecteur et ce qui a bougé (personne, animal) ; laissés vides, toute
-  détection correspond. Les actions suivantes peuvent lire ce qui a bougé
-  avec `{{triggerEvent.data.target}}`.
-- **Identifier un appareil** (action) — fait se signaler l'appareil choisi.
-  Elle indique si l'appareil a pu se signaler, pour que les actions
-  suivantes puissent en dépendre.
+- **Autoriser les commandes des thermostats** :
+  - la **consigne** d'une zone, de **4 à 30 °C** et dans les bornes que le
+    Smile donne pour la zone, au dixième de degré ; une valeur en dehors est
+    refusée, jamais ramenée dans les bornes ;
+  - le **préréglage** d'une zone, parmi ceux du Smile (maison, nuit, absent,
+    vacances, hors-gel…) ;
+  - sur un Adam, le **mode de la passerelle** (présent, absent, vacances) et
+    le **mode de régulation**, seulement **chauffage** ou **refroidissement**
+    (s'il existe) : l'arrêt de la régulation et les purges restent dans l'app
+    Plugwise.
+- **Autoriser la commande des prises** : seulement les prises réglées dans
+  l'app Plugwise comme **lampe, éclairage, TV, home cinéma, décodeur,
+  enregistreur, console de jeux ou chargeur**, et **non verrouillées** dans
+  Plugwise. Une prise qui alimente une chaudière, une pompe de chauffage, une
+  vanne, un chauffe-eau, un réfrigérateur, un congélateur, une box internet,
+  un appareil en cours de cycle, une bouilloire, ou réglée comme « autre »,
+  n'est **jamais** commandée : son état est en lecture seule dans Gladys (pas
+  un interrupteur), donc « éteins tout » ne la touche pas. Pour commander une
+  prise, réglez son type dans l'app Plugwise et déverrouillez-la, puis
+  supprimez et recréez son appareil dans Gladys.
+- Le **mode** (programme / chauffage / arrêt) et le **programme actif** sont
+  en lecture seule dans cette version ; l'eau chaude n'est jamais commandée.
+- Juste avant d'agir, Gladys **relit le Smile** et décide sur cette lecture
+  seulement : si la lecture échoue, si l'appareil a disparu, si une valeur
+  manque, si la prise est verrouillée ou d'un type interdit, rien n'est
+  envoyé ; si la valeur est déjà celle demandée, rien n'est envoyé non plus.
+  L'option est vérifiée à l'arrivée de la commande et de nouveau juste avant
+  l'envoi.
+- Quand la commande ne peut pas être vérifiée en 3,5 s, rien n'est envoyé et
+  Gladys affiche un échec (jamais d'action après un échec affiché). Une fois
+  envoyée, Gladys répond au plus 4,3 s après votre commande : « envoyée, sans
+  confirmation » si le Smile n'a pas encore répondu (la commande a pu être
+  appliquée), « refusée » si le Smile l'a refusée. Le Smile est relu 5 s
+  après chaque commande envoyée ; la valeur affichée est toujours celle que
+  le Smile donne, jamais celle demandée.
+- Les commandes passent une par une (un seul Smile).
 
-## Tableau de bord
+## Rafraîchissement et limites
 
-Ajoutez le widget **État de la démo** à un tableau de bord : il affiche en
-direct la température de la station météo et la puissance de la prise du
-bureau, la connexion utilisée par la prise (en orange si dégradée) et la
-position observée. Son bouton **Identifier la lampe** fait se signaler la
-lampe de démonstration.
+- Un Smile P1 est lu toutes les **10 secondes** (l'index chaque minute), un
+  Anna ou un Adam toutes les **30 secondes**. Seules les valeurs qui changent
+  sont envoyées à Gladys (et chacune au moins toutes les 10 minutes).
+- Les appareils sont reconnus par les identifiants Plugwise (32 caractères),
+  pas par leur nom ni l'adresse du Smile.
+- Les températures de l'eau de la chaudière sont des sondes : Gladys ne les
+  compte pas dans la température de la pièce.
 
-## Dépannage
+## Problèmes de connexion
 
-L'intégration journalise tout ce qu'elle fait : consultez les logs de
-l'intégration depuis l'interface Gladys (ou `docker logs` sur l'hôte) avec
-`LOG_LEVEL=debug` pour le détail complet.
+- **Smile injoignable** : tous les appareils apparaissent injoignables ;
+  nouvel essai après 30 s, puis de plus en plus rarement jusqu'à toutes les
+  10 min (jamais plus vite que la lecture normale).
+- **ID refusé** (HTTP 401) : Gladys ne réessaie pas seul, ni après une
+  reconnexion à Gladys, ni après un redémarrage (le refus est gardé dans
+  `/data`, sous forme d'empreinte, jamais l'ID lui-même). Corrigez l'ID puis
+  enregistrez, ou appuyez sur **Tester la connexion**.
+- **Smile surchargé** (HTTP 429) : toutes les requêtes s'arrêtent de 1 minute
+  à 6 heures, même après un redémarrage ; enregistrer la configuration ou
+  appuyer sur **Tester la connexion** lève la pause.
+- Les journaux ne contiennent ni l'ID du Smile ni le texte des réponses du
+  Smile, seulement des codes (HTTP 500, pas de connexion…).
+
+## Limites
+
+- Un seul Smile par intégration.
+- Pas de commande d'eau chaude, de programme (activer / désactiver un
+  programme), de décalage de température, ni de groupes de prises.
+- Pas de Stretch, pas de module USB Plugwise (Stick).
+- Jamais testée avec un vrai Smile.
