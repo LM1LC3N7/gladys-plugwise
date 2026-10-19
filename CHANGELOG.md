@@ -10,6 +10,8 @@ the notes of the version's GitHub Release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-19
+
 ### Added
 
 - First version, never tested with a real Smile: Plugwise Smile P1, Anna and
@@ -41,4 +43,5 @@ the notes of the version's GitHub Release.
   written one save after the other.
 - Buttons "Test the connection" and "Accept the held index".
 
-[Unreleased]: https://github.com/LM1LC3N7/gladys-plugwise/commits/main
+[Unreleased]: https://github.com/LM1LC3N7/gladys-plugwise/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/LM1LC3N7/gladys-plugwise/releases/tag/v0.1.1

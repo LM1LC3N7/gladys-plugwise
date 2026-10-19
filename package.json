@@ -1,6 +1,6 @@
 {
   "name": "gladys-plugwise",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Gladys Assistant external integration for Plugwise Smile gateways (Smile P1, Anna, Adam) through their local XML API: smart meter power and indexes, gas, zones, setpoints, presets, boiler, plugs. Unofficial, not affiliated with Plugwise.",
   "type": "module",
