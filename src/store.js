@@ -3,30 +3,54 @@
 // reference of the billed index, the value held back and the tariffs, so that
 // a restart never forgets a jump the user has not accepted; and the refusal
 // of the Smile ID (a hash, never the ID) and an HTTP 429 pause, so that a
-// restart never hammers the Smile. A small JSON file, written through a
-// temporary file and a rename. Failures are logged, never fatal.
-// (From gladys-p1-monitor.)
+// restart never hammers the Smile. A small JSON file. Failures are logged,
+// never fatal. (From gladys-p1-monitor.)
+//
+// The state lives in memory: load() reads the file once, save() replaces the
+// state at once (so a load-change-save never loses a change made by another
+// one in between) and queues the write. The writes run one after the other,
+// each through its own temporary file and a rename: the file always holds a
+// whole state, the last one saved.
 // -----------------------------------------------------------------------------
 
 import { readFileSync } from 'node:fs';
-import { rename, writeFile } from 'node:fs/promises';
+import { rename, unlink, writeFile } from 'node:fs/promises';
 
 export const DEFAULT_STATE_FILE = '/data/plugwise-state.json';
 
 export function createFileStore(file = DEFAULT_STATE_FILE) {
-  return {
-    load() {
+  let data;
+  let writes = Promise.resolve();
+  let count = 0;
+  const current = () => {
+    if (data === undefined) {
       try {
-        const data = JSON.parse(readFileSync(file, 'utf8'));
-        return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+        const read = JSON.parse(readFileSync(file, 'utf8'));
+        data = read && typeof read === 'object' && !Array.isArray(read) ? read : {};
       } catch {
-        return {};
+        data = {};
       }
-    },
-    async save(data) {
-      const tmp = `${file}.tmp`;
-      await writeFile(tmp, JSON.stringify(data), 'utf8');
-      await rename(tmp, file);
+    }
+    return data;
+  };
+  return {
+    load: () => structuredClone(current()),
+    save(next) {
+      data = structuredClone(next);
+      const text = JSON.stringify(data);
+      count += 1;
+      const tmp = `${file}.${process.pid}.${count}.tmp`;
+      const run = writes.then(async () => {
+        try {
+          await writeFile(tmp, text, 'utf8');
+          await rename(tmp, file);
+        } catch (err) {
+          await unlink(tmp).catch(() => {});
+          throw err;
+        }
+      });
+      writes = run.catch(() => {});
+      return run;
     },
   };
 }

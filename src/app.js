@@ -43,6 +43,7 @@ import {
   SETPOINT,
   STATES_PER_MINUTE,
   SWITCHABLE_PLUG_TYPES,
+  TIMEOUTS,
   ZONE_FEATURES as ZF,
 } from './constants.js';
 import {
@@ -67,6 +68,11 @@ const TRANSPORTS_PER_CALL = 100;
 /** The key of the access state (refusal, pause) in /data, next to the index guards. */
 const ACCESS_KEY = '_access';
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+const noop = () => {};
+/** A command request is waited for at most this long by the next command (its own timeout + 1 s). */
+const COMMAND_SETTLE_MS = TIMEOUTS.COMMAND + 1_000;
+/** A setpoint as Gladys may send it: a plain decimal, never 0x14, 1e1 or " 21". */
+const SETPOINT_TEXT = /^-?\d{1,3}(\.\d{1,3})?$/;
 
 /** The index Gladys already holds for a feature of a created device, when it says so. */
 function lastValueOf(device, featureId) {
@@ -127,8 +133,13 @@ export class PlugwiseApp {
     /** One Smile: the commands run one after the other. */
     this.commands = Promise.resolve();
     this.lastStatus = null;
+    this.wantedStatus = null;
     /** The index guard of the meter (src/guard.js), its tariffs, what was saved. */
     this.guard = undefined;
+    /** The index feature the guard belongs to: a guard is never used for another meter. */
+    this.guardIndexId = undefined;
+    /** The gateway of the last Smile read (a new one: a new guard). */
+    this.gatewayId = undefined;
     this.tariffRef = undefined;
     this.savedGuard = undefined;
     this.indexUndefined = false;
@@ -205,7 +216,23 @@ export class PlugwiseApp {
    * button does.
    */
   start(rawConfig, { force = false } = {}) {
+    this.restrict(rawConfig);
     return this.enqueue(() => this.run(rawConfig, { force }));
+  }
+
+  /**
+   * A permission taken away applies at once, not when the queued restart
+   * runs: a command checked meanwhile is refused. (One given is applied by
+   * the restart only.)
+   */
+  restrict(rawConfig) {
+    const next = normalizeConfig(rawConfig);
+    if (this.config.allowClimate && !next.allowClimate) {
+      this.config = { ...this.config, allowClimate: false };
+    }
+    if (this.config.allowPlugs && !next.allowPlugs) {
+      this.config = { ...this.config, allowPlugs: false };
+    }
   }
 
   async stop() {
@@ -241,11 +268,15 @@ export class PlugwiseApp {
     this.halt();
     this.dropClient();
     const generation = ++this.generation;
+    // Another address may be another Smile: its meter gets its own guard
+    // (also checked on the gateway id of every read, see useModel()).
+    if (config.smile?.origin !== this.config.smile?.origin) this.forgetGuard();
     this.rawConfig = rawConfig ?? {};
     this.config = config;
     this.configKey = key;
     this.reset();
     this.lastStatus = null;
+    this.wantedStatus = null;
     this.gladys.forgetPublishedStates?.();
     this.lastIndexAt = undefined;
 
@@ -310,7 +341,7 @@ export class PlugwiseApp {
   async resume() {
     this.halt();
     const generation = this.generation;
-    const status = this.lastStatus ? JSON.parse(this.lastStatus) : null;
+    const status = this.wantedStatus;
     this.lastStatus = null;
     this.transports.clear();
     this.discoveredKey = null;
@@ -387,11 +418,13 @@ export class PlugwiseApp {
     const wasOnline = this.online;
     this.online = false;
     this.halt();
-    await this.publishTransports();
+    // The refusal and the pause apply at once (before any await): a command
+    // arriving meanwhile is refused too.
     if (isAuthRefused(err)) {
       this.blocked = true;
       this.refusedKey = credentialsKey(this.config, this.salt);
       await this.saveAccess();
+      await this.publishTransports();
       this.logger.warn('The Smile refused the Smile ID (HTTP 401): not retried until changed');
       await this.setStatus(false, T.status.authRefused);
       return;
@@ -410,6 +443,7 @@ export class PlugwiseApp {
       delay = Math.max(this.retryDelay, this.interval());
       this.retryDelay = Math.min(this.retryDelay * 2, INTERVALS.RETRY_MAX_MS);
     }
+    await this.publishTransports();
     this.nextReadAt = this.now() + delay;
     if (wasOnline || delay <= INTERVALS.RETRY_MIN_MS) {
       // Our own message: a code or an HTTP status, never the text of the answer.
@@ -432,12 +466,17 @@ export class PlugwiseApp {
     return held ? join(message, T.notes.held(held)) : message;
   }
 
+  /**
+   * `wantedStatus` is what Gladys should show (kept even when sending it
+   * failed: resume() sends it again); `lastStatus` only skips a repeat.
+   */
   async setStatus(connected, message) {
-    const key = JSON.stringify([connected, message]);
+    this.wantedStatus = [connected, message];
+    const key = JSON.stringify(this.wantedStatus);
     if (key === this.lastStatus) return;
     this.lastStatus = key;
     await this.gladys.setConnectionStatus(connected, message).catch((err) => {
-      this.lastStatus = null;
+      if (this.lastStatus === key) this.lastStatus = null;
       this.logger.warn(`Connection status not sent: ${err.message}`);
     });
   }
@@ -465,7 +504,7 @@ export class PlugwiseApp {
       return 'unsupported';
     }
     this.unsupported = null;
-    this.model = model;
+    this.useModel(model);
     this.online = true;
     const devices = this.discoveredDevices();
     const key = JSON.stringify(devices);
@@ -474,6 +513,26 @@ export class PlugwiseApp {
     await this.publishTransports();
     await this.setStatus(true, this.okMessage());
     return true;
+  }
+
+  /** The model read now; another gateway (another Smile): the guard of the old one is dropped. */
+  useModel(model) {
+    if (model.gatewayId !== this.gatewayId) {
+      this.forgetGuard();
+      this.gatewayId = model.gatewayId;
+    }
+    this.model = model;
+  }
+
+  /** The guard and what goes with it, rebuilt from Gladys and /data when needed again. */
+  forgetGuard() {
+    this.guard = undefined;
+    this.guardIndexId = undefined;
+    this.tariffRef = undefined;
+    this.savedGuard = undefined;
+    this.lastIndexAt = undefined;
+    this.indexUndefined = false;
+    this.gatewayId = undefined;
   }
 
   discoveredDevices() {
@@ -490,7 +549,8 @@ export class PlugwiseApp {
       if (this.hasIndex(meterCreated) && this.indexUndefined && model.meter.connected) {
         notes.push(T.notes.noIndex);
       }
-      if (this.guard?.held) notes.push(T.notes.held(this.guard.held));
+      const held = this.currentGuard()?.held;
+      if (held) notes.push(T.notes.held(held));
     }
     if (model.heater && !model.heater.available) notes.push(T.notes.heaterUnavailable);
     const devices = this.discoveredDevices();
@@ -533,10 +593,13 @@ export class PlugwiseApp {
     return (this.gladys.devices ?? []).find((d) => d.external_id === externalId);
   }
 
-  hasIndex(created) {
-    const indexId = idsOf(this.gladys, KINDS.METER, this.model.gatewayId).feature(
-      MF.CONSUMPTION_INDEX,
-    );
+  /** The external id of the consumption index of the meter of a gateway. */
+  indexIdOf(gatewayId) {
+    return idsOf(this.gladys, KINDS.METER, gatewayId).feature(MF.CONSUMPTION_INDEX);
+  }
+
+  hasIndex(created, gatewayId = this.model.gatewayId) {
+    const indexId = this.indexIdOf(gatewayId);
     return (created?.features ?? []).some((f) => f.external_id === indexId);
   }
 
@@ -608,9 +671,7 @@ export class PlugwiseApp {
    */
   async guardedIndex(created) {
     if (!this.hasIndex(created)) return undefined;
-    const indexId = idsOf(this.gladys, KINDS.METER, this.model.gatewayId).feature(
-      MF.CONSUMPTION_INDEX,
-    );
+    const indexId = this.indexIdOf(this.model.gatewayId);
     const guard = this.guardOf(created, indexId);
     const { peak, offpeak } = this.model.meter.consumption;
     const sum = indexOfTariffs(offpeak, peak, this.tariffRef);
@@ -630,27 +691,32 @@ export class PlugwiseApp {
 
   /** The guard of the created meter, built from Gladys and /data when needed. */
   guardOf(created, indexId) {
-    if (!this.guard) {
+    if (!this.guard || this.guardIndexId !== indexId) {
+      // Never the guard of another meter: built again for this one.
       const saved = this.store.load()[indexId];
       this.guard = new IndexGuard(lastValueOf(created, indexId), saved, this.now());
+      this.guardIndexId = indexId;
       this.tariffRef = validTariffs(saved?.tariffs);
+      this.savedGuard = undefined;
     }
     return this.guard;
   }
 
+  /** The guard of the meter of the Smile read last, if it has a created index. */
   currentGuard() {
-    if (this.guard) return this.guard;
-    const gatewayId = this.model?.gatewayId;
-    const created = gatewayId ? this.createdDevice(KINDS.METER, gatewayId) : undefined;
-    if (!created || !this.hasIndex(created)) return undefined;
-    return this.guardOf(
-      created,
-      idsOf(this.gladys, KINDS.METER, gatewayId).feature(MF.CONSUMPTION_INDEX),
-    );
+    const gatewayId = this.model?.gatewayId ?? this.gatewayId;
+    if (!gatewayId) return undefined;
+    const indexId = this.indexIdOf(gatewayId);
+    if (this.guard && this.guardIndexId === indexId) return this.guard;
+    const created = this.createdDevice(KINDS.METER, gatewayId);
+    if (!created || !this.hasIndex(created, gatewayId)) return undefined;
+    return this.guardOf(created, indexId);
   }
 
   /** Keeps the guard in /data when its reference, its value held or the tariffs changed. */
   async saveGuard(indexId) {
+    // Never the state of one meter under the key of another.
+    if (!this.guard || this.guardIndexId !== indexId) return;
     const state = { ...this.guard.state(), tariffs: this.tariffRef ?? null };
     const key = JSON.stringify([
       indexId,
@@ -728,6 +794,7 @@ export class PlugwiseApp {
           );
       }
       this.guard = undefined;
+      this.guardIndexId = undefined;
       this.savedGuard = undefined;
       this.tariffRef = undefined;
       this.lastIndexAt = undefined;
@@ -781,10 +848,15 @@ export class PlugwiseApp {
     if (!client || this.blocked) throw new Error(T.errors.notConnected);
     if (this.paused()) throw new Error(T.errors.busy);
     const generation = this.generation;
+    // The next command waits for the real end of this one's request (bounded
+    // by its timeout), not only for Gladys's answer: a command still on its
+    // way to the Smile is never read as "already set" by the next one, which
+    // runs out of time instead ("too slow: not sent").
+    const job = { settled: undefined };
     const run = this.commands.then(() =>
-      this.command(received, { client, generation, parsed, command }),
+      this.command(received, { client, generation, parsed, command, job }),
     );
-    this.commands = run.catch(() => {});
+    this.commands = run.then(noop, noop).then(() => job.settled);
     return run;
   }
 
@@ -797,7 +869,7 @@ export class PlugwiseApp {
         const raw =
           typeof value === 'number'
             ? value
-            : typeof value === 'string' && value.trim() !== ''
+            : typeof value === 'string' && SETPOINT_TEXT.test(value)
               ? Number(value)
               : NaN;
         if (!Number.isFinite(raw) || raw < SETPOINT.MIN || raw > SETPOINT.MAX) {
@@ -844,14 +916,16 @@ export class PlugwiseApp {
     if (this.paused()) throw new Error(T.errors.busy);
   }
 
-  /** A failure of the Smile met by a command: a 429 or a 401 applies to every path. */
+  /** A failure of the Smile met by a command: a 429 or a 401 applies to every path. Never throws. */
   async shared(err, generation) {
     if ((err?.status === 429 || isAuthRefused(err)) && generation === this.generation) {
-      await this.failed(err, generation);
+      await this.failed(err, generation).catch((failure) =>
+        this.logger.error(`Failure not applied (${failure?.name ?? 'Error'})`),
+      );
     }
   }
 
-  async command(received, { client, generation, parsed, command }) {
+  async command(received, { client, generation, parsed, command, job }) {
     this.stillValid({ client, generation, command });
     const deadline = received + COMMAND_BUDGET_MS;
     if (deadline - this.now() < COMMAND_MIN_READ_MS) throw new Error(T.errors.tooSlow);
@@ -859,14 +933,15 @@ export class PlugwiseApp {
     try {
       model = await client.domainObjects({ deadline: deadline - COMMAND_MIN_SEND_MS });
     } catch (err) {
-      await this.shared(err, generation);
+      // The answer to Gladys never waits for the status to be published.
+      void this.shared(err, generation);
       throw new Error(T.errors.unknownState(err), { cause: err });
     }
     if (!model.supported) throw new Error(T.errors.unknownState({ code: CODES.BAD_ANSWER }));
     if (client === this.client && this.online) {
       // What the command just read is the newest state: shown without waiting
       // (Gladys must get its answer within 5 s).
-      this.model = model;
+      this.useModel(model);
       void this.publishStates();
     }
     const plan = this.plan(parsed, command, model);
@@ -874,7 +949,7 @@ export class PlugwiseApp {
     if (deadline - this.now() < COMMAND_MIN_SEND_MS) throw new Error(T.errors.tooSlow);
     // The last check before acting: the user may have changed things meanwhile.
     this.stillValid({ client, generation, command });
-    await this.send({ client, generation, plan, received, deadline });
+    await this.send({ client, generation, plan, received, deadline, job });
   }
 
   /** What to send, decided on the fresh read only: { already } or { label, send(options) }. */
@@ -886,6 +961,19 @@ export class PlugwiseApp {
         if (!zone) throw new Error(T.errors.gone);
         if (zone.setpoint === undefined || !zone.functionalityId) {
           throw new Error(T.errors.noSetpoint);
+        }
+        // Bounds that contradict each other (or leave nothing of 4-30 °C):
+        // nothing is trusted, nothing is sent.
+        const lower = Math.max(
+          SETPOINT.MIN,
+          Number.isFinite(zone.lower) ? zone.lower : SETPOINT.MIN,
+        );
+        const upper = Math.min(
+          SETPOINT.MAX,
+          Number.isFinite(zone.upper) ? zone.upper : SETPOINT.MAX,
+        );
+        if (lower > upper) {
+          throw new Error(T.errors.badBounds);
         }
         const { min, max } = setpointBounds(zone);
         const temperature = Math.round(command.value * 10) / 10;
@@ -903,6 +991,8 @@ export class PlugwiseApp {
         const zone = model.zones.find((z) => z.id === id);
         if (!zone) throw new Error(T.errors.gone);
         if (!zone.presets.includes(command.value)) throw new Error(T.errors.invalidPreset);
+        // The location is sent back whole: never with its type missing.
+        if (!zone.type || !zone.name) throw new Error(T.errors.noZoneType);
         if (zone.preset === command.value) return { already: true };
         return {
           label: `Preset of zone ${zone.id}`,
@@ -960,7 +1050,7 @@ export class PlugwiseApp {
    * whichever first. Whatever the outcome once it may have left, the Smile
    * is read again soon to show what it really did.
    */
-  async send({ client, generation, plan, received, deadline }) {
+  async send({ client, generation, plan, received, deadline, job }) {
     let sent = false;
     const request = plan.request(client, {
       deadline,
@@ -968,6 +1058,7 @@ export class PlugwiseApp {
         sent = true;
       },
     });
+    if (job) job.settled = this.settled(request);
     let handle;
     const ack = new Promise((resolve) => {
       handle = this.timers.setTimeout(resolve, Math.max(0, received + COMMAND_ACK_MS - this.now()));
@@ -997,13 +1088,29 @@ export class PlugwiseApp {
       throw new Error(T.errors.unconfirmed({ code: CODES.TIMEOUT }));
     }
     const { err } = outcome;
-    await this.shared(err, generation);
+    // The answer to Gladys never waits for the status to be published.
+    void this.shared(err, generation);
     if (err?.notSent || !sent) throw new Error(T.errors.notSent(err), { cause: err });
     // An HTTP 4xx: the Smile answered and refused. Anything else may have been applied.
     if (err?.code === CODES.HTTP && err.status >= 400 && err.status < 500) {
       throw new Error(T.errors.refused(err), { cause: err });
     }
     throw new Error(T.errors.unconfirmed(err), { cause: err });
+  }
+
+  /**
+   * Resolves when `request` ends, or COMMAND_SETTLE_MS later at the latest
+   * (its own timeout ends it before). Never rejects. Its timer is not one of
+   * the loop's: halt() never clears it (the commands would stall).
+   */
+  settled(request) {
+    let handle;
+    const limit = new Promise((resolve) => {
+      handle = this.timers.setTimeout(resolve, COMMAND_SETTLE_MS);
+    });
+    return Promise.race([request.then(noop, noop), limit]).finally(() =>
+      this.timers.clearTimeout(handle),
+    );
   }
 
   /** Read the Smile again soon (after a command): the reading loop restarts from there. */
@@ -1034,7 +1141,7 @@ export class PlugwiseApp {
       return T.test.slow;
     }
     if (!this.online || !this.model) {
-      const message = this.lastStatus ? JSON.parse(this.lastStatus)[1] : null;
+      const message = this.wantedStatus?.[1] ?? null;
       return message ?? { en: T.errors.notConnected, fr: 'Le Smile n’est pas connecté' };
     }
     return T.test.ok({

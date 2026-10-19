@@ -58,7 +58,7 @@ Ouvrez ensuite l'onglet **Découverte** et créez les appareils à suivre. Le
 bouton **Tester la connexion** lit le Smile tout de suite et liste ce qu'il
 montre.
 
-## Énergie (Smile P1)
+## Énergie (Smile P1, Anna P1)
 
 - L'**index de consommation** (tarif plein + tarif creux, en kWh) est la seule
   valeur que le suivi énergétique de Gladys compte et facture. Il n'existe que

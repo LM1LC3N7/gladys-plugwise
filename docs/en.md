@@ -55,7 +55,7 @@ Unofficial integration, not affiliated with Plugwise.
 Then open the **Discover** tab and create the devices to follow. The **Test
 the connection** button reads the Smile at once and lists what it shows.
 
-## Energy (Smile P1)
+## Energy (Smile P1, Anna P1)
 
 - The **consumption index** (peak + off-peak tariff, in kWh) is the only
   value the Gladys energy monitoring counts and bills. It exists only when

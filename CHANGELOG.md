@@ -30,9 +30,15 @@ the notes of the version's GitHub Release.
   regulation mode (heating / cooling only) behind `allow_climate`; relay of
   the unlocked lighting and entertainment plugs behind `allow_plugs` (a plug
   feeding a boiler, a pump, a fridge... is read only). Fresh read before
-  acting, 3.5 s budget, answer at 4.3 s at most.
+  acting, 3.5 s budget, answer at 4.3 s at most. A command waits for the
+  request of the previous one to really end (bounded by its timeout), so it
+  never concludes "already set" on a state the Smile has not applied yet;
+  a permission taken away in the configuration applies at once.
 - A minimal XML reader without DTD (no XXE, no entity expansion), bounded
-  and linear.
+  and linear; the model read in linear time, an answer with more than 500
+  zones, plugs, rules or presets refused.
+- The state in `/data` (index guard per meter, refusal hash, 429 pause)
+  written one save after the other.
 - Buttons "Test the connection" and "Accept the held index".
 
 [Unreleased]: https://github.com/LM1LC3N7/gladys-plugwise/commits/main

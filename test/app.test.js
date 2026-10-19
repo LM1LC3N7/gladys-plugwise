@@ -9,7 +9,13 @@ import assert from 'node:assert/strict';
 import { createFakeGladys } from '@gladysassistant/integration-sdk/testing';
 import { PlugwiseApp } from '../src/app.js';
 import { normalizeConfig } from '../src/config.js';
-import { ACTIONS, COMMAND_ACK_MS, INTERVALS, READ_AFTER_COMMAND_MS } from '../src/constants.js';
+import {
+  ACTIONS,
+  COMMAND_ACK_MS,
+  INTERVALS,
+  READ_AFTER_COMMAND_MS,
+  TIMEOUTS,
+} from '../src/constants.js';
 import { registerHandlers } from '../src/handlers.js';
 import { CODES, SmileError } from '../src/smile/errors.js';
 import { createMemoryStore } from '../src/store.js';
@@ -90,6 +96,15 @@ const featureOf = (gladys, kind, id, key) =>
 const command = (gladys, kind, id, key, value) =>
   gladys.fake.setValue(deviceOf(gladys, kind, id), featureOf(gladys, kind, id, key), value);
 const settle = () => new Promise((resolve) => setImmediate(resolve));
+/** How long the next command waits at most for a request still running. */
+const SETTLE_MS = TIMEOUTS.COMMAND + 1_000;
+/** `promise`, or 'stuck' when it has not resolved within 1 s (real time). */
+const orStuck = (promise) =>
+  Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve('stuck'), 1000))]);
+/** Gladys never answers the connection status. */
+const statusHangs = (gladys) => {
+  gladys.setConnectionStatus = () => new Promise(() => {});
+};
 
 // --- Configuration and lifecycle ------------------------------------------------------
 
@@ -353,7 +368,20 @@ test('setpoint: the value checked strictly; the bounds of the zone on the fresh 
     '$125<',
   );
   const { gladys, smile } = await ready({ xml });
-  for (const value of [null, '', true, 'abc', 3.9, 30.01, NaN]) {
+  for (const value of [
+    null,
+    '',
+    true,
+    'abc',
+    3.9,
+    30.01,
+    NaN,
+    '0x14',
+    '1e1',
+    ' 21',
+    '21.',
+    '+21',
+  ]) {
     const ack = await command(gladys, 'zone', LIVING, 'target', value);
     assert.equal(ack.success, false, String(value));
     assert.match(ack.error, /from 4 to 30/);
@@ -405,6 +433,8 @@ test('the answer of a command: sent without confirmation, refused, not sent', as
   assert.equal(late.success, false);
   assert.match(late.error, /^Command sent to the Smile, without confirmation/);
   assert.ok(timers.delays().includes(READ_AFTER_COMMAND_MS), 'read again soon');
+  // The next commands wait for its request to end: here its time limit.
+  await timers.run((ms) => ms === SETTLE_MS);
   // A 5xx after sending: it may have been applied.
   smile.putAnswer = () => {
     throw new SmileError(CODES.HTTP, 'HTTP 500', { status: 500 });
@@ -483,6 +513,142 @@ test('plugs: switched only when unlocked AND a lighting or entertainment type, r
     assert.match((await command(gladys, 'plug', MEDIA_TV, 'state', value)).error, /0 or 1/);
   }
   assert.equal(smile.puts.length, 1);
+});
+
+/** The Adam with the setpoint of the living room at `value`. */
+const livingAt = (value) =>
+  adamUnlocked().replace(
+    /(<thermostat_functionality id='928d6446caad406d9eb2340dd1134e32'>[\s\S]*?<setpoint>)20\.5</,
+    `$1${value}<`,
+  );
+
+/** Send a command whose PUT does not answer; Gladys gets "without confirmation" at 4.3 s. */
+async function unanswered(env, kind, id, key, value) {
+  let answer;
+  env.smile.putAnswer = () =>
+    new Promise((resolve) => {
+      answer = () => resolve({ status: 202, headers: {}, body: Buffer.alloc(0) });
+    });
+  const puts = env.smile.puts.length;
+  const pending = command(env.gladys, kind, id, key, value);
+  while (env.smile.puts.length === puts) await settle();
+  await settle();
+  await env.timers.run((ms) => ms > 0 && ms <= COMMAND_ACK_MS);
+  const ack = await pending;
+  assert.match(ack.error, /without confirmation/);
+  env.smile.putAnswer = () => ({ status: 202, headers: {}, body: Buffer.alloc(0) });
+  return () => answer();
+}
+
+test('plug off still on its way, then on: never "already on", the second one runs out of time', async () => {
+  const env = await ready();
+  const { gladys, smile, timers, clock } = env;
+  await unanswered(env, 'plug', MEDIA_TV, 'state', 0);
+  // The Smile still shows the plug on: the next command must not conclude "already".
+  const gets = smile.gets.length;
+  const on = command(gladys, 'plug', MEDIA_TV, 'state', 1);
+  for (let i = 0; i < 20; i += 1) await settle();
+  assert.equal(smile.gets.length, gets, 'it waits for the first request to end');
+  // The first request ends at its time limit: too late for the second one.
+  clock.now += SETTLE_MS;
+  await timers.run((ms) => ms === SETTLE_MS);
+  const ack = await on;
+  assert.equal(ack.success, false);
+  assert.match(ack.error, /too slow to answer: command not sent/);
+  assert.equal(smile.puts.length, 1, 'only the first one was sent');
+});
+
+test('setpoint 22 still on its way, then 20: read once 22 is applied, 20 sent', async () => {
+  const env = await ready({ xml: livingAt(20) });
+  const { gladys, smile } = env;
+  const answer = await unanswered(env, 'zone', LIVING, 'target', 22);
+  const back = command(gladys, 'zone', LIVING, 'target', 20);
+  for (let i = 0; i < 20; i += 1) await settle();
+  assert.equal(smile.puts.length, 1, 'waiting, not "already 20"');
+  // The Smile applies 22 and answers: the second command reads it, then sends 20.
+  smile.xml = livingAt(22);
+  answer();
+  const ack = await back;
+  assert.equal(ack.success, true, ack.error);
+  assert.equal(smile.puts.length, 2);
+  assert.match(smile.puts[1].body, /<setpoint>20<\/setpoint>/);
+});
+
+test('a 429 or a 401 met by a command: Gladys gets its answer even if the status hangs', async () => {
+  const busy = await ready();
+  statusHangs(busy.gladys);
+  busy.smile.getAnswer = () => ({ status: 429, headers: {}, body: Buffer.alloc(0) });
+  const read = await orStuck(command(busy.gladys, 'zone', LIVING, 'target', 21));
+  assert.notEqual(read, 'stuck');
+  assert.match(read.error, /could not be read just before acting/);
+  assert.equal(busy.app.paused(), true, 'the pause applies to every path');
+
+  const refused = await ready();
+  statusHangs(refused.gladys);
+  refused.smile.putAnswer = () => {
+    throw new SmileError(CODES.HTTP, 'HTTP 401', { status: 401 });
+  };
+  const put = await orStuck(command(refused.gladys, 'zone', LIVING, 'target', 21));
+  assert.notEqual(put, 'stuck');
+  assert.match(put.error, /refused the command/);
+  assert.equal(refused.app.blocked, true);
+});
+
+test('a permission taken away applies at once, before the queued restart', async () => {
+  const { app, gladys, smile } = await ready();
+  // A restart in progress holds the queue.
+  let release;
+  smile.onGet = () => new Promise((resolve) => (release = resolve));
+  const restart = app.start(ALLOW, { force: true });
+  while (!release) await settle();
+  smile.onGet = null;
+  void gladys.fake.configUpdated({ ...ALLOW, allow_climate: false, allow_plugs: false });
+  for (let i = 0; i < 10; i += 1) await settle();
+  assert.equal(app.config.allowClimate, false);
+  assert.equal(app.config.allowPlugs, false);
+  release();
+  await restart;
+});
+
+test('preset without a zone type, setpoint bounds that contradict: nothing sent', async () => {
+  const noType = adamUnlocked().replace(
+    /(<location id='f2bf9048bef64cc5b6d5110154e33c81'>[\s\S]*?)<type>livingroom<\/type>/,
+    '$1',
+  );
+  const first = await ready({ xml: noType });
+  const preset = await command(first.gladys, 'zone', LIVING, 'preset', 'asleep');
+  assert.match(preset.error, /no type or name for this zone/);
+  assert.equal(first.smile.puts.length, 0);
+
+  const crossed = adamUnlocked().replace(
+    /(<thermostat_functionality id='928d6446caad406d9eb2340dd1134e32'>[\s\S]*?<lower_bound>)1</,
+    '$125<',
+  );
+  const bounds = crossed.replace(
+    /(<thermostat_functionality id='928d6446caad406d9eb2340dd1134e32'>[\s\S]*?<upper_bound>)35</,
+    '$120<',
+  );
+  const second = await ready({ xml: bounds });
+  const ack = await command(second.gladys, 'zone', LIVING, 'target', 21);
+  assert.match(ack.error, /bounds for this zone that leave no valid value/);
+  assert.equal(second.smile.puts.length, 0);
+});
+
+test('a status Gladys did not take is sent again at the reconnection', async () => {
+  const { gladys, start } = await setup();
+  const original = gladys.setConnectionStatus;
+  gladys.setConnectionStatus = async () => {
+    throw new Error('Gladys away');
+  };
+  await start();
+  gladys.setConnectionStatus = original;
+  const before = gladys.fake.connectionStatuses.length;
+  gladys.emit('disconnected');
+  gladys.emit('connected');
+  for (let i = 0; i < 20; i += 1) await settle();
+  assert.equal(gladys.fake.connectionStatuses.length, before + 1);
+  assert.equal(status(gladys).connected, true);
+  assert.match(status(gladys).message.en, /9 devices found/);
 });
 
 // --- The smart meter (Smile P1) and its index -------------------------------------------
@@ -575,6 +741,37 @@ test('Smile P1: a jump of the index is held until the user accepts it; never 0',
   assert.equal(store.data[id].held, null);
   const nothing = await gladys.fake.action(ACTIONS.ACCEPT_HELD);
   assert.match(nothing.data.message.en, /nothing to accept/);
+});
+
+test('another Smile: its meter gets its own guard, nothing of the first one under its key', async () => {
+  const store = createMemoryStore();
+  const { gladys, smile, start, createAll } = await setup({ xml: P1(), store });
+  await start();
+  await createAll();
+  const first = gladys.fake.discoveredDevices[0].external_id;
+  const firstGateway = first.split(':').at(-1);
+  const firstIndex = `${first}:consumption_index`;
+  assert.equal(last(gladys, firstIndex), 31610.031);
+  const kept = structuredClone(store.data[firstIndex]);
+  // The same address now answers with another Smile P1, at a much lower index.
+  const OTHER = 'fedcba9876543210fedcba9876543210';
+  smile.xml = P1({ offpeak: '1000000.00', peak: '500000.00' }).replaceAll(firstGateway, OTHER);
+  await gladys.fake.configUpdated(CONFIG);
+  await createAll();
+  const otherIndex = ext('meter', OTHER, 'consumption_index');
+  assert.equal(last(gladys, otherIndex), 1500, 'never held against the first meter');
+  assert.equal(store.data[otherIndex].last.value, 1500);
+  assert.equal(store.data[otherIndex].held, null);
+  assert.deepEqual(store.data[firstIndex], kept, 'the first meter untouched');
+  assert.doesNotMatch(status(gladys).message.en, /held back/);
+  // Back to the first Smile, both meters created: each its own guard again.
+  const otherKept = structuredClone(store.data[otherIndex]);
+  smile.xml = P1();
+  await gladys.fake.configUpdated(CONFIG);
+  assert.equal(last(gladys, firstIndex), 31610.031, 'never the value of the other meter');
+  assert.deepEqual(store.data[firstIndex], kept);
+  assert.deepEqual(store.data[otherIndex], otherKept, 'the other meter untouched');
+  assert.doesNotMatch(status(gladys).message.en, /held back/);
 });
 
 test('Smile P1: the meter not connected, or a frozen power: not published', async () => {

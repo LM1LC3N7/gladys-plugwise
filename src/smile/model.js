@@ -44,6 +44,16 @@ const SCHEDULE_TAG = 'zone_preset_based_on_time_and_presence_with_override';
 const P1_NOT_CONNECTED = 'P1 does not seem to be connected';
 const NO_OPENTHERM = 'no OpenTherm communication';
 
+/**
+ * Caps of a hostile answer: a real Adam has a few tens of each. Above, the
+ * whole answer is refused (never a part of it read as the truth).
+ */
+export const MODEL_LIMITS = Object.freeze({ ZONES: 500, PLUGS: 500, RULES: 500, PRESETS: 500 });
+
+const tooMany = (what) => {
+  throw new SmileError(CODES.BAD_ANSWER, `Too many ${what} in the answer`);
+};
+
 /** The logs of `kind` (point_log, cumulative_log, interval_log) of `type` in a container. */
 const logsOf = (container, kind, type) =>
   children(child(container, 'logs'), kind).filter((log) => textAt(log, 'type') === type);
@@ -200,33 +210,46 @@ function parseGateway(appliance, home, smile) {
 function parsePresets(rules) {
   let found = rules.filter((r) => attr(child(r, 'template'), 'tag') === PRESET_TAG);
   if (found.length === 0) found = rules.filter((r) => textAt(r, 'name') === PRESET_RULE_NAME);
-  const names = [];
+  const names = new Set();
   for (const rule of found) {
     for (const when of children(child(rule, 'directives'), 'when')) {
       const preset = attr(when, 'preset');
-      if (preset && !names.includes(preset)) names.push(preset);
+      if (!preset || names.has(preset)) continue;
+      names.add(preset);
+      if (names.size > MODEL_LIMITS.PRESETS) tooMany('presets');
     }
   }
-  return names;
+  return [...names];
 }
 
-/** The schedules of a location and the one active there (python-plugwise _schedules). */
-function parseSchedule(rules, locationId) {
-  let selected;
-  const available = [];
+/**
+ * The schedule rules, indexed once (python-plugwise _schedules): their name,
+ * whether active, and the Set of the location ids they apply to.
+ */
+function scheduleRules(rules) {
+  const result = [];
   for (const rule of rules) {
     if (attr(child(rule, 'template'), 'tag') !== SCHEDULE_TAG || !child(rule, 'directives')) {
       continue;
     }
     const name = textAt(rule, 'name');
     if (!name) continue;
-    available.push(name);
-    const here = paths(rule, 'contexts/context/zone/location').some(
-      (l) => attr(l, 'id') === locationId,
-    );
-    if (here && textAt(rule, 'active') === 'true') selected = name;
+    result.push({
+      name,
+      active: textAt(rule, 'active') === 'true',
+      locations: new Set(paths(rule, 'contexts/context/zone/location').map((l) => attr(l, 'id'))),
+    });
   }
-  return { available, selected };
+  return result;
+}
+
+/** The schedule active at a location, if any (the last one, as python-plugwise). */
+function parseSchedule(schedules, locationId) {
+  let selected;
+  for (const rule of schedules) {
+    if (rule.active && rule.locations.has(locationId)) selected = rule.name;
+  }
+  return { selected };
 }
 
 /** The thermostat functionality of a location (the setpoint and its bounds). */
@@ -235,10 +258,10 @@ const thermostatOf = (location) =>
     (f) => textAt(f, 'type') === 'thermostat',
   );
 
-function parseZone(location, { rules, presets, temperatureFrom, regulationMode }) {
+function parseZone(location, { schedules, presets, temperatureFrom, regulationMode }) {
   const functionality = thermostatOf(location);
   const id = attr(location, 'id');
-  const schedule = parseSchedule(rules, id);
+  const schedule = parseSchedule(schedules, id);
   let mode = schedule.selected ? 'auto' : 'heat';
   if (!schedule.selected && regulationMode === 'cooling') mode = 'cool';
   if (regulationMode === 'off') mode = 'off';
@@ -338,10 +361,16 @@ export function parseDomainObjects(root, { now = Date.now() } = {}) {
   }
 
   const rules = children(root, 'rule');
+  if (rules.length > MODEL_LIMITS.RULES) tooMany('rules');
   const presets = parsePresets(rules);
+  const schedules = scheduleRules(rules);
   const regulationMode = result.gateway.regulationMode;
   const locationOf = (a) => attr(child(a, 'location'), 'id');
   const byId = new Map(locations.map((l) => [attr(l, 'id'), l]));
+  const addZone = (zone) => {
+    if (result.zones.length >= MODEL_LIMITS.ZONES) tooMany('zones');
+    result.zones.push(zone);
+  };
 
   if (smile === 'anna') {
     // The Anna: the room of the thermostat (one with actuators: python-plugwise skips the orphans).
@@ -353,29 +382,32 @@ export function parseDomainObjects(root, { now = Date.now() } = {}) {
     );
     const room = anna ? byId.get(locationOf(anna)) : undefined;
     if (room && thermostatOf(room) && PLUGWISE_ID.test(attr(room, 'id') ?? '')) {
-      result.zones.push(
-        parseZone(room, { rules, presets, temperatureFrom: anna, regulationMode: undefined }),
+      addZone(
+        parseZone(room, { schedules, presets, temperatureFrom: anna, regulationMode: undefined }),
       );
     }
   } else {
-    // Adam: every location with a thermostat functionality and a thermostat in it.
+    // Adam: every location with a thermostat functionality and a thermostat in
+    // it. The locations holding a thermostat are indexed once (linear).
+    const withThermostat = new Set();
+    for (const appliance of appliances) {
+      if (THERMO_MATCHING.has(textAt(appliance, 'type'))) withThermostat.add(locationOf(appliance));
+    }
     for (const location of locations) {
       const id = attr(location, 'id');
-      if (!PLUGWISE_ID.test(id ?? '') || textAt(location, 'type') === 'building') continue;
-      if (!thermostatOf(location)) continue;
-      const hasThermostat = appliances.some(
-        (a) => THERMO_MATCHING.has(textAt(a, 'type')) && locationOf(a) === id,
-      );
-      if (!hasThermostat) continue;
-      result.zones.push(
-        parseZone(location, { rules, presets, temperatureFrom: undefined, regulationMode }),
+      if (!PLUGWISE_ID.test(id ?? '') || !withThermostat.has(id)) continue;
+      if (textAt(location, 'type') === 'building' || !thermostatOf(location)) continue;
+      addZone(
+        parseZone(location, { schedules, presets, temperatureFrom: undefined, regulationMode }),
       );
     }
+    const heaterId = attr(heaterElement, 'id');
     for (const appliance of appliances) {
       const id = attr(appliance, 'id');
-      if (!PLUGWISE_ID.test(id ?? '') || id === attr(heaterElement, 'id')) continue;
+      if (!PLUGWISE_ID.test(id ?? '') || id === heaterId) continue;
       if (!path(appliance, 'actuator_functionalities/relay_functionality')) continue;
       if (!isPlugDescription(textAt(appliance, 'description'))) continue;
+      if (result.plugs.length >= MODEL_LIMITS.PLUGS) tooMany('plugs');
       result.plugs.push(parsePlug(appliance));
     }
   }

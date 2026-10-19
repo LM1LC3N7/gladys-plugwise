@@ -3,5 +3,6 @@ npm-debug.log*
 .env
 .env.*
 data/
+test/.store-*/
 *.log
 .DS_Store

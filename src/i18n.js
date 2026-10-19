@@ -225,7 +225,10 @@ export const T = {
     gone: 'This device is no longer on the Smile: command not sent',
     invalidSetpoint: (min, max) => `The setpoint must be a number from ${min} to ${max} °C`,
     noSetpoint: 'The Smile gives no setpoint for this zone right now: command not sent',
+    badBounds:
+      'The Smile gives setpoint bounds for this zone that leave no valid value: command not sent',
     invalidPreset: 'This preset is not one of the Smile: command not sent',
+    noZoneType: 'The Smile gives no type or name for this zone right now: preset not sent',
     invalidMode: 'This mode is not one of the Smile: command not sent',
     unsafeRegulationMode:
       'Only "heating" and "cooling" can be set from Gladys (off and the bleeding cycles stay in the Plugwise app): command not sent',

@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { parseXml } from '../src/smile/xml.js';
-import { number, onOff, parseDomainObjects } from '../src/smile/model.js';
+import { MODEL_LIMITS, number, onOff, parseDomainObjects } from '../src/smile/model.js';
 
 export const fixture = (name) =>
   readFileSync(new URL(`./fixtures/${name}.xml`, import.meta.url), 'utf8');
@@ -190,6 +190,91 @@ test('not a Smile answer: refused', () => {
       ),
     /No gateway or home location/,
   );
+});
+
+// --- Hostile answers: bounded and linear ----------------------------------------------
+
+/** A Plugwise id from a number and a one-letter prefix. */
+const hexId = (prefix, n) => `${prefix}${n.toString(16).padStart(31, '0')}`;
+const location = (id, thermostatId) =>
+  `<location id='${id}'><name>L</name><type>room</type><actuator_functionalities>` +
+  `<thermostat_functionality id='${thermostatId}'><type>thermostat</type><setpoint>20</setpoint>` +
+  '</thermostat_functionality></actuator_functionalities></location>';
+const appliance = (id, type, locationId, extra = '') =>
+  `<appliance id='${id}'><type>${type}</type><location id='${locationId}'/>${extra}</appliance>`;
+const scheduleRule = (id, locationIds) =>
+  `<rule id='${id}'><name>S${id.slice(-4)}</name><active>true</active>` +
+  "<template tag='zone_preset_based_on_time_and_presence_with_override'/><directives/><contexts>" +
+  locationIds.map((l) => `<context><zone><location id='${l}'/></zone></context>`).join('') +
+  '</contexts></rule>';
+const adamWith = (extra) =>
+  fixture('adam_plus_anna_new').replace('</domain_objects>', `${extra}</domain_objects>`);
+const parseAdam = (xml) => parseDomainObjects(parseXml(xml), { now: timeOf(xml) });
+
+test('a hostile answer of 2.5 MiB is read in linear time', () => {
+  const parts = [];
+  const locations = [];
+  for (let i = 0; i < 4500; i += 1) {
+    const id = hexId('a', i);
+    locations.push(id);
+    parts.push(location(id, hexId('b', i)));
+  }
+  // Many appliances, none a thermostat but in 400 of the locations: 402 zones.
+  for (let i = 0; i < 9000; i += 1) {
+    parts.push(appliance(hexId('c', i), 'valve_actuator', locations[i % locations.length]));
+  }
+  for (let i = 0; i < 400; i += 1) parts.push(appliance(hexId('d', i), 'thermostat', locations[i]));
+  for (let i = 0; i < 300; i += 1) {
+    parts.push(scheduleRule(hexId('e', i), locations.slice(i, i + 15)));
+  }
+  const xml = adamWith(parts.join(''));
+  assert.ok(xml.length >= 2.5 * 1024 * 1024, `${xml.length} characters`);
+  const root = parseXml(xml);
+  const started = performance.now();
+  const model = parseDomainObjects(root, { now: timeOf(xml) });
+  const elapsed = performance.now() - started;
+  assert.equal(model.zones.length, 402);
+  assert.ok(elapsed < 200, `analysed in ${Math.round(elapsed)} ms`);
+});
+
+test('too many zones, plugs, rules or presets: the whole answer is refused', () => {
+  const over = MODEL_LIMITS.ZONES + 1;
+  const range = (n) => Array.from({ length: n }, (_, i) => i);
+  const zones = range(over)
+    .map(
+      (i) =>
+        location(hexId('a', i), hexId('b', i)) +
+        appliance(hexId('d', i), 'thermostat', hexId('a', i)),
+    )
+    .join('');
+  assert.throws(() => parseAdam(adamWith(zones)), /Too many zones/);
+  const relay =
+    "<actuator_functionalities><relay_functionality id='x'/></actuator_functionalities>";
+  const plugs = range(MODEL_LIMITS.PLUGS + 1)
+    .map((i) =>
+      appliance(
+        hexId('c', i),
+        'lamp',
+        hexId('a', 0),
+        `<description>smart plug</description>${relay}`,
+      ),
+    )
+    .join('');
+  assert.throws(() => parseAdam(adamWith(plugs)), /Too many plugs/);
+  const rules = range(MODEL_LIMITS.RULES + 1)
+    .map((i) => `<rule id='${hexId('e', i)}'><name>R</name></rule>`)
+    .join('');
+  assert.throws(() => parseAdam(adamWith(rules)), /Too many rules/);
+  const presets =
+    "<rule id='ffffffffffffffffffffffffffffffff'><name>Thermostat presets</name>" +
+    "<template tag='zone_setpoint_and_state_based_on_preset'/><directives>" +
+    range(MODEL_LIMITS.PRESETS + 1)
+      .map((i) => `<when preset='p${i}'/>`)
+      .join('') +
+    '</directives></rule>';
+  assert.throws(() => parseAdam(adamWith(presets)), /Too many presets/);
+  // The real Adam, nothing added: read.
+  assert.equal(parseAdam(adamWith('')).zones.length, 2);
 });
 
 test('malformed values are undefined, never 0', () => {
